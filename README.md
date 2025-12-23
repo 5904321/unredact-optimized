@@ -68,7 +68,8 @@ No OCR is performed.
 
 ```bash
 pip install pdfplumber pymupdf
-
+```
 ## Use
 ```bash
 python redact_extract.py example.pdf
+```
