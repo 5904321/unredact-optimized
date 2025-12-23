@@ -34,7 +34,7 @@ This mode is ideal for:
 
 Example:
 
-![Side-by-side example](https://raw.githubusercontent.com/leedrake5/unredact/master/examples/example.png)
+![Side-by-side example](https://raw.githubusercontent.com/leedrake5/unredact/master/examples/an_example.png)
 
 ---
 
