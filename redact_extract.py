@@ -1,21 +1,54 @@
 import os
-import argparse
+import sys
 import time
+import argparse
+import threading
 import multiprocessing as mp
 from tqdm import tqdm
 import pymupdf  # PyMuPDF
 
 
 # ============================================================
-# TEXT GROUPING / BUILDING
+# PAUSE CONTROLLER
+# ============================================================
+
+class PauseController:
+    def __init__(self):
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+        self.stop = False
+
+    def toggle(self):
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            print("\n⏸ Paused (press 'p' to resume)")
+        else:
+            self.pause_event.set()
+            print("\n▶ Resumed")
+
+    def wait(self):
+        self.pause_event.wait()
+
+
+def keyboard_listener(ctrl: PauseController):
+    while not ctrl.stop:
+        key = sys.stdin.read(1).lower()
+        if key == "p":
+            ctrl.toggle()
+        elif key == "q":
+            ctrl.stop = True
+            ctrl.pause_event.set()
+            print("\n⛔ Abort requested")
+            break
+
+
+# ============================================================
+# TEXT PROCESSING
 # ============================================================
 
 def group_words_into_lines(words, line_tol):
-    words.sort(key=lambda w: (w[1], w[0]))  # top, x0
-
-    lines = []
-    current = []
-    current_top = None
+    words.sort(key=lambda w: (w[1], w[0]))
+    lines, current, current_top = [], [], None
 
     for w in words:
         top = w[1]
@@ -29,53 +62,45 @@ def group_words_into_lines(words, line_tol):
 
     if current:
         lines.append(current)
-
     return lines
 
 
 def build_line_text(line_words, space_unit, min_spaces):
-    line_words.sort(key=lambda w: w[0])  # x0
-
+    line_words.sort(key=lambda w: w[0])
     parts = [line_words[0][3]]
     prev_x1 = line_words[0][2]
-    font_size = line_words[0][4]
+    fs = line_words[0][4]
 
     for x0, _, x1, text, _ in line_words[1:]:
         gap = x0 - prev_x1
         if gap > 0:
-            spaces = max(min_spaces, int(gap / space_unit))
-            parts.append(" " * spaces)
+            parts.append(" " * max(min_spaces, int(gap / space_unit)))
         parts.append(text)
         prev_x1 = max(prev_x1, x1)
 
-    return "".join(parts), line_words[0][0], line_words[0][1], font_size
+    return "".join(parts), line_words[0][0], line_words[0][1], fs
 
 
 # ============================================================
-# WORKER (MUST BE TOP-LEVEL)
+# MULTIPROCESS WORKER (TOP-LEVEL)
 # ============================================================
 
 def process_page(args):
-    pdf_path, page_number, line_tol, space_unit, min_spaces = args
-
+    pdf_path, page_no, line_tol, space_unit, min_spaces = args
     doc = pymupdf.open(pdf_path)
-    page = doc[page_number]
+    page = doc[page_no]
 
     words_raw = page.get_text("words")
     page_width = page.rect.width
-
     words = []
+
     for x0, y0, x1, y1, text, *_ in words_raw:
         if not text.strip():
             continue
-
-        font_size = max(6.0, y1 - y0)
-        if font_size < 5:
+        fs = max(6.0, y1 - y0)
+        if fs < 5 or x0 > page_width:
             continue
-        if x0 > page_width:
-            continue
-
-        words.append((x0, y0, x1, text, font_size))
+        words.append((x0, y0, x1, text, fs))
 
     doc.close()
 
@@ -85,10 +110,9 @@ def process_page(args):
     for lw in lines:
         text, x0, top, fs = build_line_text(lw, space_unit, min_spaces)
         if text.strip():
-            y = top + fs * 0.85
-            out.append((text, x0, y, fs))
+            out.append((text, x0, top + fs * 0.85, fs))
 
-    return page_number, out
+    return page_no, out
 
 
 # ============================================================
@@ -96,47 +120,53 @@ def process_page(args):
 # ============================================================
 
 def make_side_by_side(input_pdf, output_pdf, line_tol, space_unit, min_spaces):
+    pause_ctrl = PauseController()
+    threading.Thread(target=keyboard_listener, args=(pause_ctrl,), daemon=True).start()
+
     src = pymupdf.open(input_pdf)
     out = pymupdf.open()
-
     total_pages = len(src)
-    cpu_count = mp.cpu_count()
     results = [None] * total_pages
 
-    # prepare args ONCE (important for speed)
     worker_args = [
         (input_pdf, i, line_tol, space_unit, min_spaces)
         for i in range(total_pages)
     ]
 
     # ------------------ EXTRACT ------------------
-    start_time = time.time()
-    processed = 0
+    start = time.time()
+    done = 0
 
-    with mp.Pool(cpu_count) as pool:
-        with tqdm(total=total_pages, desc="Extracting (all cores)", unit="page") as pbar:
+    with mp.Pool(mp.cpu_count()) as pool:
+        with tqdm(total=total_pages, desc="Extracting", unit="page") as pbar:
             for page_no, data in pool.imap_unordered(process_page, worker_args):
+                if pause_ctrl.stop:
+                    pool.terminate()
+                    pool.join()
+                    raise KeyboardInterrupt("Aborted")
+
+                pause_ctrl.wait()
                 results[page_no] = data
-                processed += 1
+                done += 1
                 pbar.update(1)
 
-                if processed % 10 == 0 or processed == total_pages:
-                    elapsed = time.time() - start_time
-                    avg = elapsed / processed
-                    remaining = total_pages - processed
-                    eta = int(avg * remaining)
-                    m, s = divmod(eta, 60)
-                    pbar.set_postfix_str(f"ETA {m:02d}:{s:02d}")
+                if done % 10 == 0 or done == total_pages:
+                    eta = int(((time.time() - start) / done) * (total_pages - done))
+                    pbar.set_postfix_str(f"ETA {eta//60:02d}:{eta%60:02d}")
 
     # ------------------ RENDER ------------------
-    start_time = time.time()
-    processed = 0
+    start = time.time()
+    done = 0
 
     with tqdm(total=total_pages, desc="Rendering", unit="page") as pbar:
         for i, src_page in enumerate(src):
+            if pause_ctrl.stop:
+                raise KeyboardInterrupt("Aborted")
+
+            pause_ctrl.wait()
+
             rect = src_page.rect
             w, h = rect.width, rect.height
-
             new_page = out.new_page(width=2 * w, height=h)
             new_page.show_pdf_page(pymupdf.Rect(0, 0, w, h), src, i)
 
@@ -149,19 +179,15 @@ def make_side_by_side(input_pdf, output_pdf, line_tol, space_unit, min_spaces):
                     overlay=True
                 )
 
-            processed += 1
+            done += 1
             pbar.update(1)
-
-            elapsed = time.time() - start_time
-            avg = elapsed / processed
-            remaining = total_pages - processed
-            eta = int(avg * remaining)
-            m, s = divmod(eta, 60)
-            pbar.set_postfix_str(f"ETA {m:02d}:{s:02d}")
+            eta = int(((time.time() - start) / done) * (total_pages - done))
+            pbar.set_postfix_str(f"ETA {eta//60:02d}:{eta%60:02d}")
 
     out.save(output_pdf)
     src.close()
     out.close()
+    pause_ctrl.stop = True
 
 
 # ============================================================
@@ -194,5 +220,5 @@ def main():
 
 
 if __name__ == "__main__":
-    mp.freeze_support()  # REQUIRED on Windows
+    mp.freeze_support()
     main()
